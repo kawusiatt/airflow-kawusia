@@ -1,97 +1,78 @@
 #!/usr/bin/env bash
 
-TRY_LOOP="20"
+CMD="airflow"
+TRY_LOOP="${TRY_LOOP:-10}"
+POSTGRES_HOST="${POSTGRES_HOST:-postgres}"
+POSTGRES_PORT=5432
+POSTGRES_CREDS="${POSTGRES_CREDS:-airflow:airflow}"
+RABBITMQ_HOST="${RABBITMQ_HOST:-rabbitmq}"
+RABBITMQ_CREDS="${RABBITMQ_CREDS:-airflow:airflow}"
+RABBITMQ_MANAGEMENT_PORT=15672
+FLOWER_URL_PREFIX="${FLOWER_URL_PREFIX:-}"
+AIRFLOW_URL_PREFIX="${AIRFLOW_URL_PREFIX:-}"
+LOAD_DAGS_EXAMPLES="${LOAD_DAGS_EXAMPLES:-true}"
+GIT_SYNC_REPO="${GIT_SYNC_REPO:-}"
 
-: "${REDIS_HOST:="redis"}"
-: "${REDIS_PORT:="6379"}"
-: "${REDIS_PASSWORD:=""}"
-
-: "${POSTGRES_HOST:="postgres"}"
-: "${POSTGRES_PORT:="5432"}"
-: "${POSTGRES_USER:="airflow"}"
-: "${POSTGRES_PASSWORD:="airflow"}"
-: "${POSTGRES_DB:="airflow"}"
-
-# Defaults and back-compat
-: "${AIRFLOW_HOME:="/usr/local/airflow"}"
-: "${AIRFLOW__CORE__FERNET_KEY:=${FERNET_KEY:=$(python -c "from cryptography.fernet import Fernet; FERNET_KEY = Fernet.generate_key().decode(); print(FERNET_KEY)")}}"
-: "${AIRFLOW__CORE__EXECUTOR:=${EXECUTOR:-Sequential}Executor}"
-
-export \
-  AIRFLOW_HOME \
-  AIRFLOW__CELERY__BROKER_URL \
-  AIRFLOW__CELERY__RESULT_BACKEND \
-  AIRFLOW__CORE__EXECUTOR \
-  AIRFLOW__CORE__FERNET_KEY \
-  AIRFLOW__CORE__LOAD_EXAMPLES \
-  AIRFLOW__CORE__SQL_ALCHEMY_CONN \
-
-
-# Load DAGs exemples (default: Yes)
-if [[ -z "$AIRFLOW__CORE__LOAD_EXAMPLES" && "${LOAD_EX:=n}" == n ]]
-then
-  AIRFLOW__CORE__LOAD_EXAMPLES=False
+if [ -z $FERNET_KEY ]; then
+    FERNET_KEY=$(python3 -c "from cryptography.fernet import Fernet; FERNET_KEY = Fernet.generate_key().decode(); print(FERNET_KEY)")
 fi
 
-# Install custom python package if requirements.txt is present
-if [ -e "/requirements.txt" ]; then
-    $(command -v pip) install --user -r /requirements.txt
-fi
+echo "Postgres host: $POSTGRES_HOST"
+echo "RabbitMQ host: $RABBITMQ_HOST"
+echo "Load DAG examples: $LOAD_DAGS_EXAMPLES"
+echo "Git sync repository: $GIT_SYNC_REPO"
+echo
 
-if [ -n "$REDIS_PASSWORD" ]; then
-    REDIS_PREFIX=:${REDIS_PASSWORD}@
-else
-    REDIS_PREFIX=
-fi
+# Generate Fernet key
+sed -i "s/{{ FERNET_KEY }}/${FERNET_KEY}/" $AIRFLOW_HOME/airflow.cfg
+sed -i "s/{{ POSTGRES_HOST }}/${POSTGRES_HOST}/" $AIRFLOW_HOME/airflow.cfg
+sed -i "s/{{ POSTGRES_CREDS }}/${POSTGRES_CREDS}/" $AIRFLOW_HOME/airflow.cfg
+sed -i "s/{{ RABBITMQ_HOST }}/${RABBITMQ_HOST}/" $AIRFLOW_HOME/airflow.cfg
+sed -i "s/{{ RABBITMQ_CREDS }}/${RABBITMQ_CREDS}/" $AIRFLOW_HOME/airflow.cfg
+sed -i "s/{{ LOAD_DAGS_EXAMPLES }}/${LOAD_DAGS_EXAMPLES}/" $AIRFLOW_HOME/airflow.cfg
+sed -i "s#{{ FLOWER_URL_PREFIX }}#${FLOWER_URL_PREFIX}#" $AIRFLOW_HOME/airflow.cfg
+sed -i "s#{{ AIRFLOW_URL_PREFIX }}#${AIRFLOW_URL_PREFIX}#" $AIRFLOW_HOME/airflow.cfg
 
-wait_for_port() {
-  local name="$1" host="$2" port="$3"
-  local j=0
-  while ! nc -z "$host" "$port" >/dev/null 2>&1 < /dev/null; do
-    j=$((j+1))
+# wait for rabbitmq
+if [ "$1" = "webserver" ] || [ "$1" = "worker" ] || [ "$1" = "scheduler" ] || [ "$1" = "flower" ] ; then
+  j=0
+  while ! curl -sI -u $RABBITMQ_CREDS http://$RABBITMQ_HOST:$RABBITMQ_MANAGEMENT_PORT/api/whoami |grep '200 OK'; do
+    j=`expr $j + 1`
     if [ $j -ge $TRY_LOOP ]; then
-      echo >&2 "$(date) - $host:$port still not reachable, giving up"
+      echo "$(date) - $RABBITMQ_HOST still not reachable, giving up"
       exit 1
     fi
-    echo "$(date) - waiting for $name... $j/$TRY_LOOP"
+    echo "$(date) - waiting for RabbitMQ... $j/$TRY_LOOP"
     sleep 5
   done
-}
-
-if [ "$AIRFLOW__CORE__EXECUTOR" != "SequentialExecutor" ]; then
-  AIRFLOW__CORE__SQL_ALCHEMY_CONN="postgresql+psycopg2://$POSTGRES_USER:$POSTGRES_PASSWORD@$POSTGRES_HOST:$POSTGRES_PORT/$POSTGRES_DB"
-  AIRFLOW__CELERY__RESULT_BACKEND="db+postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@$POSTGRES_HOST:$POSTGRES_PORT/$POSTGRES_DB"
-  wait_for_port "Postgres" "$POSTGRES_HOST" "$POSTGRES_PORT"
 fi
 
-if [ "$AIRFLOW__CORE__EXECUTOR" = "CeleryExecutor" ]; then
-  AIRFLOW__CELERY__BROKER_URL="redis://$REDIS_PREFIX$REDIS_HOST:$REDIS_PORT/1"
-  wait_for_port "Redis" "$REDIS_HOST" "$REDIS_PORT"
-fi
-
-case "$1" in
-  webserver)
-    airflow initdb
-    if [ "$AIRFLOW__CORE__EXECUTOR" = "LocalExecutor" ] || [ "$AIRFLOW__CORE__EXECUTOR" = "SequentialExecutor" ]; then
-      # With the "Local" and "Sequential" executors it should all run in one container.
-      airflow scheduler &
+# wait for postgres
+if [ "$1" = "webserver" ] || [ "$1" = "worker" ] || [ "$1" = "scheduler" ] ; then
+  i=0
+  while ! nc $POSTGRES_HOST $POSTGRES_PORT >/dev/null 2>&1 < /dev/null; do
+    i=`expr $i + 1`
+    if [ $i -ge $TRY_LOOP ]; then
+      echo "$(date) - ${POSTGRES_HOST}:${POSTGRES_PORT} still not reachable, giving up"
+      exit 1
     fi
-    exec airflow webserver
-    ;;
-  worker|scheduler)
-    # To give the webserver time to run initdb.
-    sleep 10
-    exec airflow "$@"
-    ;;
-  flower)
-    sleep 10
-    exec airflow "$@"
-    ;;
-  version)
-    exec airflow "$@"
-    ;;
-  *)
-    # The command is something like bash, not an airflow subcommand. Just run it in the right environment.
-    exec "$@"
-    ;;
-esac
+    echo "$(date) - waiting for ${POSTGRES_HOST}:${POSTGRES_PORT}... $i/$TRY_LOOP"
+    sleep 5
+  done
+  # TODO: move to a Helm hook
+  #   https://github.com/kubernetes/helm/blob/master/docs/charts_hooks.md
+  if [ "$1" = "webserver" ]; then
+    echo "Initialize database..."
+    $CMD initdb
+  fi
+fi
+
+if [ ! -z $GIT_SYNC_REPO ]; then
+    mkdir -p $AIRFLOW_HOME/dags
+    # remove possible embedded dags to avoid conflicts
+    rm -rf $AIRFLOW_HOME/dags/*
+    echo "Executing background task git-sync on repo $GIT_SYNC_REPO"
+    $AIRFLOW_HOME/git-sync --dest $AIRFLOW_HOME/dags --force &
+fi
+
+$CMD "$@"
